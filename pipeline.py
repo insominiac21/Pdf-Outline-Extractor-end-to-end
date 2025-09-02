@@ -40,6 +40,7 @@ class DocChunk:
     doc_id: str
     chunk_id: int
     text: str
+    page_num: int  # Add page number tracking
 
 def ensure_dir(p: str):
     Path(p).mkdir(parents=True, exist_ok=True)
@@ -55,18 +56,23 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-def read_text_from_pdf(path: Path) -> str:
-    """Extract text from PDF using PyMuPDF."""
-    import fitz  # PyMuPDF
+def read_text_from_pdf(path: Path) -> List[Dict[str, str]]:
+    """Extract text from PDF with page numbers."""
     try:
         doc = fitz.open(path)
-        text = ""
-        for page in doc:
-            text += page.get_text()
-        return text
+        pages = []
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            text = page.get_text()
+            if text.strip():  # Only add non-empty pages
+                pages.append({
+                    "text": text,
+                    "page": page_num + 1
+                })
+        return pages
     except Exception as e:
         logger.error(f"Failed to extract text from {path}: {e}")
-        return f"[ERROR extracting {path.name}]"
+        return [{"text": f"[ERROR extracting {path.name}]", "page": 1}]
 
 def split_into_chunks(text: str, chunk_size: int, overlap: int) -> List[str]:
     """Split text into overlapping chunks, trying to break at sentence boundaries."""
@@ -121,25 +127,68 @@ def split_into_chunks(text: str, chunk_size: int, overlap: int) -> List[str]:
     return chunks
 
 @task
-def task_load_pdfs(data_dir: str) -> Dict[str, str]:
+def task_load_pdfs(data_dir: str) -> Dict[str, List[Dict[str, str]]]:
     paths = sorted(Path(data_dir).glob("*.pdf"))
-    if not paths:
-        logger.warning(f"No PDFs found in {data_dir}")
-        raise RuntimeError(f"No PDFs found in {data_dir}. Please add PDFs first.")
-    
     docs = {}
     for p in paths:
         docs[p.stem] = read_text_from_pdf(p)
-    logger.info(f"Loaded {len(docs)} documents")
     return docs
 
 @task
-def task_chunk_docs(docs: Dict[str, str], chunk_size: int, overlap: int) -> List[DocChunk]:
+def task_chunk_docs(docs: Dict[str, List[Dict[str, str]]], chunk_size: int, overlap: int) -> List[DocChunk]:
     chunks: List[DocChunk] = []
-    for doc_id, text in docs.items():
-        parts = text.split()  # Simple split for demo
-        chunk = DocChunk(doc_id=doc_id, chunk_id=0, text=text)
-        chunks.append(chunk)
+    chunk_id = 0
+    
+    for doc_id, pages in docs.items():
+        for page in pages:
+            text = page["text"]
+            page_num = page["page"]
+            
+            # Split page text into chunks
+            sentences = text.split(". ")
+            current_chunk = []
+            current_length = 0
+            
+            for sentence in sentences:
+                sentence = sentence.strip() + ". "
+                words = sentence.split()
+                
+                if current_length + len(words) <= chunk_size:
+                    current_chunk.append(sentence)
+                    current_length += len(words)
+                else:
+                    if current_chunk:  # Save current chunk
+                        chunks.append(DocChunk(
+                            doc_id=doc_id,
+                            chunk_id=chunk_id,
+                            text="".join(current_chunk),
+                            page_num=page_num
+                        ))
+                        chunk_id += 1
+                        
+                        # Handle overlap
+                        if overlap > 0:
+                            # Keep last few sentences for overlap
+                            overlap_text = current_chunk[-2:] if len(current_chunk) > 2 else current_chunk[-1:]
+                            current_chunk = overlap_text
+                            current_length = sum(len(t.split()) for t in current_chunk)
+                        else:
+                            current_chunk = []
+                            current_length = 0
+                    
+                    current_chunk.append(sentence)
+                    current_length = len(words)
+            
+            # Add remaining text as final chunk
+            if current_chunk:
+                chunks.append(DocChunk(
+                    doc_id=doc_id,
+                    chunk_id=chunk_id,
+                    text="".join(current_chunk),
+                    page_num=page_num
+                ))
+                chunk_id += 1
+    
     return chunks
 
 @task
@@ -159,21 +208,20 @@ def task_build_index(embeddings: np.ndarray) -> faiss.Index:
 
 @task
 def task_save_artifacts(index: faiss.Index, chunks: List[DocChunk], index_dir: str) -> str:
-    """Save FAISS index and mapping with text content."""
     ensure_dir(index_dir)
     
     # Save FAISS index
     index_path = Path(index_dir) / "index.faiss"
     mapping_path = Path(index_dir) / "mapping.json"
     
-    # Save index directly (no dict wrapping needed)
     faiss.write_index(index, str(index_path))
     
-    # Save mapping with text content
+    # Save mapping with page numbers
     mapping = [{
         "doc_id": c.doc_id,
         "chunk_id": c.chunk_id,
-        "text": c.text
+        "text": c.text,
+        "page": c.page_num
     } for c in chunks]
     
     with open(mapping_path, 'w', encoding='utf-8') as f:
@@ -205,8 +253,53 @@ def rag_flow(
     return metrics
 
 # Query interface
-def query(text: str, top_k: int = 5) -> List[Dict]:
-    """Query the RAG system with proper error handling."""
+def summarize_chunk(text: str, max_words: int = 50) -> str:
+    """Create a brief summary of chunk text, preserving sentence boundaries."""
+    sentences = text.split(". ")
+    words = []
+    total_words = 0
+    
+    for sentence in sentences:
+        sentence_words = sentence.split()
+        if total_words + len(sentence_words) <= max_words:
+            words.extend(sentence_words)
+            total_words += len(sentence_words)
+        else:
+            break
+    
+    summary = " ".join(words)
+    return summary + "..." if total_words == max_words else summary
+
+def generate_final_answer(query: str, results: List[Dict]) -> str:
+    """Generate a structured final answer from search results."""
+    answer_parts = []
+    answer_parts.append(f"Based on {len(results)} relevant sections, here's a travel plan:")
+    
+    # Extract key information
+    answer_parts.append("\n1. Recommended Activities:")
+    for r in results[:2]:  # Use top 2 results for activities
+        if "Things to Do" in r["doc_id"]:
+            summary = summarize_chunk(r["text"], 75)
+            answer_parts.append(f"   • {summary}")
+    
+    # Add dining recommendations
+    answer_parts.append("\n2. Dining Options:")
+    for r in results:
+        if "Cuisine" in r["doc_id"] or "Restaurants" in r["doc_id"]:
+            summary = summarize_chunk(r["text"], 75)
+            answer_parts.append(f"   • {summary}")
+    
+    # Add tips
+    answer_parts.append("\n3. Travel Tips:")
+    for r in results:
+        if "Tips" in r["doc_id"]:
+            summary = summarize_chunk(r["text"], 75)
+            answer_parts.append(f"   • {summary}")
+    
+    return "\n".join(answer_parts)
+
+def query(text: str, top_k: int = 5) -> Dict:
+    """Enhanced query with summaries and page info."""
     index_path = INDEX_DIR
     model = SentenceTransformer(EMBEDDING_MODEL)
     
@@ -232,18 +325,32 @@ def query(text: str, top_k: int = 5) -> List[Dict]:
         # Search
         sims, idxs = index.search(q_emb, top_k)
         
-        # Format results with safe text access
+        # Enhanced results with summaries
         results = []
+        context_texts = []
         for i, idx in enumerate(idxs[0]):
             doc_info = mapping[idx]
+            full_text = doc_info.get("text", "[Text not found]")
+            page_num = doc_info.get("page", 1)  # Default to page 1 if not found
+            
             results.append({
                 "rank": i+1,
                 "doc_id": doc_info["doc_id"],
-                "chunk_id": doc_info["chunk_id"],
-                "text": doc_info.get("text", "[Text not found]"),
-                "score": float(sims[0][i])
+                "page": page_num,
+                "score": float(sims[0][i]),
+                "summary": summarize_chunk(full_text)
             })
-        return results
+            context_texts.append(full_text)
+        
+        # Generate final answer with increased word limit
+        final_answer = f"Based on {len(results)} relevant sections from the documents:\n"
+        final_answer += "\nRecommended answer (250 words max): "
+        final_answer += summarize_chunk(" ".join(context_texts), max_words=250)
+        
+        return {
+            "results": results,
+            "answer": final_answer
+        }
         
     except Exception as e:
         logging.error(f"Error during query: {str(e)}")
