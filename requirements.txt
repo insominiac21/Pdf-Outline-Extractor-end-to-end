@@ -1,0 +1,25 @@
+# Core deps
+setuptools<81.0.0  # Pin to avoid deprecation warning
+
+# Core
+sentence-transformers==3.0.1
+faiss-cpu==1.8.0
+numpy>=1.26
+
+# Tracking / Orchestration / Monitoring
+mlflow==2.14.1
+prefect==2.19.9
+prometheus-client==0.20.0
+
+# API
+fastapi==0.112.0
+uvicorn==0.30.5
+pydantic==2.8.2
+
+# Optional / Evaluation
+rank-bm25==0.2.2
+evidently==0.4.30
+python-dotenv==1.0.1
+
+# PDF Processing
+PyMuPDF==1.23.26
